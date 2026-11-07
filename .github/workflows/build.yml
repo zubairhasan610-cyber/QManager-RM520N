@@ -1,9 +1,9 @@
 name: QManager Build
 
 on:
-  workflow_dispatch:
   push:
-    branches: [main]
+    branches: [cloud-build]
+  workflow_dispatch:
 
 jobs:
   build:

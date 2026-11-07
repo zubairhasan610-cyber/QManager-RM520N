@@ -1,0 +1,14 @@
+# /lib/systemd/system/qmanager-firewall.service
+[Unit]
+Description=QManager Port Firewall
+Before=qmanager-setup.service lighttpd.service dropbear.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/qmanager_firewall start
+ExecReload=/usr/bin/qmanager_firewall reload
+ExecStop=/usr/bin/qmanager_firewall stop
+
+[Install]
+WantedBy=multi-user.target

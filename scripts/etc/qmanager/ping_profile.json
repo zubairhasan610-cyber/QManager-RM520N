@@ -1,0 +1,8 @@
+{
+  "profile": "relaxed",
+  "interval_sec": 5,
+  "target_host_1": "cloudflare.com",
+  "target_host_2": "google.com",
+  "target_ip_1": "1.1.1.1",
+  "target_ip_2": "8.8.8.8"
+}

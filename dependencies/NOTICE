@@ -1,0 +1,12 @@
+QManager RM520N — bundled third-party binaries
+==============================================
+
+Attribution for third-party code linked into the bundled binaries.
+
+--------------------------------------------------------------------------------
+qmanager_atd
+--------------------------------------------------------------------------------
+First-party QManager binary (source in `native/`). It is statically linked
+against musl libc (MIT License), the Rust standard library and the `libc`
+crate (each MIT License or Apache License, Version 2.0, at your option); all
+are redistributed in binary form under those terms.

@@ -1,0 +1,91 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# build artifacts
+qmanager-build/
+qmanager_install/
+RELEASE_NOTE.md
+
+# language-pack build output (maintainer `bun run lang build`)
+/dist/
+
+# claude superpowers
+/.superpowers
+/.claude
+
+# NOTE: /docs/superpowers re-ignored 2026-09-01 (reversing the 2026-08-25 un-ignore
+# above). Solo project, single author — the "silent untracked sibling" risk that
+# justified tracking it no longer applies, since there's no teammate who'd miss an
+# update. Plans/specs written there by the writing-plans skill are scratch working
+# notes now, not committed project records — no need to `git add` or clean them up
+# once a task is done; just let them accumulate locally.
+/docs/superpowers
+
+# simpleadmin source
+/simpleadmin-source
+
+# bundled build tools (developer-local; not part of the repo)
+/tools/*
+!/tools/modem-mcp/
+
+# Health check directory
+/health-checks/
+
+# Investigation scratch (probe scripts, raw logs)
+/scratch/
+# Go host build artifacts (device binary ships via build-discord-bot.sh tarball)
+discord-bot/*.exe
+
+# Reimagine directory
+/reimagine/
+
+# Rescue directory
+/scripts-dev/rescue/
+
+# Orchestration scratch (run plans, recon dumps, token/i18n captures).
+# The ledger beside it IS tracked; only the working files are local.
+/.orchestra/scratch/
+
+node_modules
+.next
+out
+.git

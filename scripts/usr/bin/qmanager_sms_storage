@@ -1,0 +1,82 @@
+#!/bin/sh
+# =============================================================================
+# qmanager_sms_storage — One-Shot Boot-Time SMS Storage Routing (RM520N-GL)
+# =============================================================================
+# Ported from the RM551E sibling project's qmanager_sms_storage daemon
+# (procd init.d), translated to a systemd oneshot for RM520N-GL.
+#
+# Purpose: route incoming SMS to the user's chosen storage even if the SMS
+# Center page is never opened. The choice is /etc/qmanager/sms_storage ("ME" or
+# "SM"; missing = ME, the 255-slot modem store), written by
+# cellular/sms_storage.sh. The inbox GET (sms.sh) re-applies it on every load.
+#
+# Flow:
+#   1. Poll `qcmd AT` until the modem answers (up to ~60s). qcmd takes the
+#      shared AT lock per call, so a slow-booting modem never starves other
+#      AT consumers.
+#   2. Once ready, issue AT+CPMS="X","X","X" through qcmd (X = the choice). The
+#      CPMS mem3 route is also the QMI WMS routing setting that `qsms` relies on.
+#      If SM is chosen but the SIM store is unusable (no SIM), ME is used for
+#      this boot without changing the saved choice.
+#   3. Log the result and exit. 0 on success, 1 on failure/timeout. No
+#      respawn — this is a oneshot, not a supervised daemon.
+#
+# Does NOT reboot or call CFUN. Run once at boot by
+# qmanager-sms-storage.service, after qmanager-setup.service (so
+# the AT lock file exists and is writable) and qmanager-cfun-fix.service
+# (so the radio is confirmed on), and before qmanager-poller.service.
+#
+# Install location: /usr/bin/qmanager_sms_storage
+# Dependencies: qcmd
+# =============================================================================
+
+# Guarded with -f: BusyBox ash exits when `.` cannot find its file.
+if [ -f /usr/lib/qmanager/qlog.sh ]; then
+    . /usr/lib/qmanager/qlog.sh
+else
+    qlog_init() { :; }
+    qlog_info() { :; }
+    qlog_warn() { :; }
+fi
+qlog_init "sms_storage"
+
+QCMD="/usr/bin/qcmd"
+READY_TRIES=20
+READY_SLEEP=3
+
+# --- Wait for modem readiness (qcmd locks per call) -------------------------
+ready=0
+i=0
+while [ "$i" -lt "$READY_TRIES" ]; do
+    if "$QCMD" "AT" >/dev/null 2>&1; then
+        ready=1
+        break
+    fi
+    i=$((i + 1))
+    sleep "$READY_SLEEP"
+done
+
+if [ "$ready" -ne 1 ]; then
+    qlog_warn "Modem not ready after $((READY_TRIES * READY_SLEEP))s — CPMS routing not applied"
+    exit 1
+fi
+
+# --- Apply routing ----------------------------------------------------------
+mem=$({ tr -d ' \r\n' < /etc/qmanager/sms_storage | tr 'a-z' 'A-Z'; } 2>/dev/null)
+[ "$mem" = "SM" ] || mem="ME"
+if [ "$mem" = "SM" ] && ! /usr/bin/qsms status SM >/dev/null 2>&1; then
+    qlog_warn "SIM storage chosen but unusable; using modem storage this boot"
+    mem="ME"
+fi
+
+# Single quotes would block $mem, so escape the inner quotes. qcmd fails by exit status.
+"$QCMD" "AT+CPMS=\"$mem\",\"$mem\",\"$mem\"" >/dev/null 2>&1
+apply_rc=$?
+
+if [ "$apply_rc" -eq 0 ]; then
+    qlog_info "CPMS routing set to $mem (incoming SMS storage)"
+    exit 0
+fi
+
+qlog_warn "Failed to set CPMS routing to $mem (rc=$apply_rc)"
+exit 1

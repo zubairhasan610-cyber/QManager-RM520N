@@ -1,0 +1,90 @@
+#!/bin/sh
+# =============================================================================
+# qmanager_crash_log_append — Root helper: append a validated reboot-cause
+# entry to /usrdata/qmanager/crash.log
+# =============================================================================
+# lighttpd runs reboot.sh as www-data, which must not write the log directly.
+# The log lives in the root-owned /usrdata/qmanager (not the www-data-owned
+# /etc/qmanager), so the path cannot be swapped for a symlink under a root
+# writer. This helper is the sanctioned pattern (same shape as
+# qmanager_ethernet_apply): narrowly-scoped root logic behind one bare-path
+# sudoers line, every input hardcoded/validated rather than interpolated.
+#
+# Usage:  qmanager_crash_log_append <reason>
+#   <reason> — ONLY the literal "user" is accepted. This helper exists
+#   solely so system/reboot.sh can classify a user-initiated reboot; any
+#   other cause (watchdog Tier 4, unplanned) is already written directly by
+#   qmanager_watchcat, which runs as root and needs no sudoers gate.
+#
+# Exit: 0 = appended, 1 = rejected/failed (JSON error on stdout, matching
+#       the other qmanager_* root helpers' convention)
+#
+# Called via sudoers: www-data ALL=(root) NOPASSWD: /usr/bin/qmanager_crash_log_append
+# Install location: /usr/bin/qmanager_crash_log_append
+# =============================================================================
+
+PATH=/opt/bin:/opt/sbin:/usr/bin:/usr/sbin:/bin:/sbin; export PATH
+umask 022
+
+# Fallback constant keeps the helper working if the lib is missing.
+CRASH_LOG="/usrdata/qmanager/crash.log"
+if [ -f /usr/lib/qmanager/crash_log.sh ]; then
+    . /usr/lib/qmanager/crash_log.sh
+    CRASH_LOG="$QM_CRASH_LOG"
+fi
+MAX_LINES=20
+
+reason="$1"
+
+# --- Reason whitelist: never interpolate arbitrary caller text ---------------
+case "$reason" in
+    user) ;;
+    *)
+        printf '{"success":false,"error":"invalid_reason","detail":"reason must be exactly \"user\""}\n'
+        exit 1
+        ;;
+esac
+
+# Ensure the root-owned dir and migrate the legacy www-data-writable log.
+command -v qm_crash_log_prepare >/dev/null 2>&1 && qm_crash_log_prepare
+
+# --- Symlink refusal (the dir is root-owned; this is belt-and-braces) --------
+if [ -L "$CRASH_LOG" ]; then
+    printf '{"success":false,"error":"write_failed","detail":"crash.log is a symlink"}\n'
+    exit 1
+fi
+
+# --- Size cap --------------------------------------------------------------
+# Root workers append reboot/skip lines directly, unbounded by MAX_LINES
+# below; trim runaway growth before we add our own line. Never fails the append.
+precap_count=$(wc -l < "$CRASH_LOG" 2>/dev/null || echo 0)
+case "$precap_count" in ''|*[!0-9]*) precap_count=0 ;; esac
+if [ "$precap_count" -gt 200 ]; then
+    precap_tmp="${CRASH_LOG}.precap.tmp"
+    if tail -n 100 "$CRASH_LOG" > "$precap_tmp" 2>/dev/null; then
+        mv "$precap_tmp" "$CRASH_LOG" 2>/dev/null || rm -f "$precap_tmp"
+    else
+        rm -f "$precap_tmp"
+    fi
+fi
+
+epoch=$(date +%s)
+if ! echo "${epoch}|reboot|${reason}" >> "$CRASH_LOG" 2>/dev/null; then
+    printf '{"success":false,"error":"write_failed","detail":"Failed to append to crash.log"}\n'
+    exit 1
+fi
+
+# --- Trim to last N lines (matches qmanager_watchcat's own convention) ------
+count=$(wc -l < "$CRASH_LOG" 2>/dev/null || echo 0)
+case "$count" in ''|*[!0-9]*) count=0 ;; esac
+if [ "$count" -gt "$MAX_LINES" ]; then
+    tmp="${CRASH_LOG}.tmp"
+    if tail -n "$MAX_LINES" "$CRASH_LOG" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$CRASH_LOG" 2>/dev/null || rm -f "$tmp"
+    else
+        rm -f "$tmp"
+    fi
+fi
+
+printf '{"success":true}\n'
+exit 0

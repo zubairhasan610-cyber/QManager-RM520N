@@ -1,0 +1,740 @@
+#!/bin/sh
+# =============================================================================
+# qmanager_update — Background OTA updater
+# =============================================================================
+# Spawned by update.sh CGI. Downloads, verifies, installs, and reboots.
+#
+# Usage:
+#   qmanager_update install <download_url> <version> [download_size] [--unattended]
+#   qmanager_update download <tarball_url> <checksum_url> <version>
+#   qmanager_update install_staged
+#   qmanager_update rollback <rollback_url> <rollback_version>
+#
+# Every mode accepts only official release URLs and refuses to install unless
+# the release's sha256sum.txt verifies (see verify_checksum()). The optional
+# [--unattended] flag is accepted for compatibility and changes nothing.
+# =============================================================================
+
+LOG_FILE="/tmp/qmanager_update.log"
+INSTALL_LOG="/tmp/qmanager_install.log"
+STATUS_FILE="/tmp/qmanager_update.json"
+PID_FILE="/tmp/qmanager_update.pid"
+REBOOT_ACK_FILE="/tmp/qmanager_reboot_ack"
+WATCHCAT_LOCK="/tmp/qmanager_watchcat.lock"
+# 20s gives the cold-cache /reboot/ page time to download bundles, hydrate,
+# and fire reboot_ack before the worker proceeds. Matches the CGI default in
+# cgi_base.sh ($QM_REBOOT_ACK_TIMEOUT) so every reboot path shares one budget.
+REBOOT_ACK_TIMEOUT=20
+VERSION_FILE="/etc/qmanager/VERSION"
+PENDING_FILE="/etc/qmanager/VERSION.pending"
+UPDATES_DIR="/etc/qmanager/updates"
+
+# Platform abstraction (systemd support)
+[ -f /usr/lib/qmanager/platform.sh ] && . /usr/lib/qmanager/platform.sh
+
+# Forward-compat: load shared semver helpers if available
+[ -f /usr/lib/qmanager/semver.sh ] && . /usr/lib/qmanager/semver.sh
+
+# Downloader abstraction (curl/wget auto-detect). The inline fallback keeps OTA
+# working if the library is somehow absent (e.g. a partial install).
+if [ -f /usr/lib/qmanager/downloader.sh ]; then
+    . /usr/lib/qmanager/downloader.sh
+else
+    export PATH="/opt/bin:/opt/sbin:/usr/bin:/usr/sbin:/bin:/sbin:$PATH"
+    qm_download() {
+        local url="$1" dest="$2" timeout="${3:-120}" rc
+        if command -v curl >/dev/null 2>&1; then
+            curl -fSL --max-time "$timeout" -o "$dest" "$url"
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q -T "$timeout" -O "$dest" "$url"
+        else
+            return 1
+        fi
+        rc=$?
+        [ "$rc" -ne 0 ] && rm -f "$dest"
+        return "$rc"
+    }
+fi
+
+# --- Helpers -----------------------------------------------------------------
+
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG_FILE"; }
+
+# Atomic write — prevents readers from seeing partial JSON during the write.
+# $5 is an `errors` catalog code the UI translates; the message stays English for the log.
+write_status() {
+    local status="$1" msg="$2" version="$3" size="$4" code="${5:-}"
+    jq -n \
+        --arg status "$status" \
+        --arg message "$msg" \
+        --arg version "$version" \
+        --arg size "$size" \
+        --arg error "$code" \
+        '{status: $status, message: $message, version: $version, size: $size,
+          error: (if $error == "" then null else $error end)}' \
+        > "${STATUS_FILE}.tmp" && mv "${STATUS_FILE}.tmp" "$STATUS_FILE"
+}
+
+get_current_version() {
+    if [ -f "$VERSION_FILE" ]; then
+        tr -d '[:space:]' < "$VERSION_FILE"
+    else
+        echo "0.0.0"
+    fi
+}
+
+# scrub_legacy_cron — Remove orphaned QManager cron markers from a device
+# updated from a pre-timer release.
+#
+# Scheduled Reboot, Tower Lock schedule, and (formerly) Low Power Mode used
+# to printf lines into /var/spool/cron/crontabs/root — lines BusyBox crond
+# never actually read (RM520N has no crond daemon running; see
+# schedule_timer.sh). Those writers are now retired/migrated to
+# runtime-generated systemd timers, but an OTA-upgraded device may still
+# carry the old dead lines on disk. If a future release (or a manually
+# started `crond`) ever DID start reading that file, stale entries firing
+# `qmanager_scheduled_reboot`, `qmanager_tower_schedule`, or the
+# already-deleted `qmanager_low_power` unattended would be a nasty surprise.
+# Scrub them on every OTA install/rollback so they can never resurrect.
+scrub_legacy_cron() {
+    local cron_file="/var/spool/cron/crontabs/root"
+    [ -f "$cron_file" ] || return 0
+    if grep -qE 'qmanager_scheduled_reboot|qmanager_tower_schedule|qmanager_low_power' "$cron_file" 2>/dev/null; then
+        # grep exits 1 when it selects NO lines. For `grep -v` that means
+        # "every line was a qmanager marker" — i.e. the crontab consists
+        # ENTIRELY of our entries, which is the single most important case to
+        # scrub. An `&& mv` here would short-circuit on that exit 1, silently
+        # leave every marker in place, and still log success. So capture the
+        # status and treat 0 and 1 alike; only 2+ is a real grep error.
+        local rc=0
+        grep -vE 'qmanager_scheduled_reboot|qmanager_tower_schedule|qmanager_low_power' \
+            "$cron_file" > "${cron_file}.tmp" 2>/dev/null || rc=$?
+        if [ "$rc" -le 1 ]; then
+            # crontabs are conventionally 0600 root:root, and the redirect
+            # above creates the temp with the ambient umask. Set the mode
+            # before the rename so the live file is never briefly loosened.
+            chmod 600 "${cron_file}.tmp" 2>/dev/null || true
+            # Log success only if the rename actually happened. The old code
+            # got this right by accident via its `&& mv && log` chain; keep
+            # the property explicitly now that the chain is gone.
+            if mv "${cron_file}.tmp" "$cron_file"; then
+                log "Scrubbed legacy QManager cron markers from $cron_file"
+            else
+                rm -f "${cron_file}.tmp"
+                log "WARNING: could not replace $cron_file — legacy markers left in place"
+            fi
+        else
+            rm -f "${cron_file}.tmp"
+            log "WARNING: failed to scrub legacy cron markers from $cron_file"
+        fi
+    fi
+}
+
+http_download() {
+    local url="$1" dest="$2" timeout="${3:-120}"
+    # Transport is curl or wget, whichever the device has (see downloader.sh).
+    if ! qm_download "$url" "$dest" "$timeout"; then
+        log "ERROR: download failed for $url (no curl/wget, or network error)"
+        return 1
+    fi
+    return 0
+}
+
+# Release assets live only at <RELEASE_PREFIX><tag>/<asset>. A case glob alone
+# is not enough: `*` matches "/", and curl collapses "../" before it sends.
+RELEASE_PREFIX="https://github.com/dr-dolomite/QManager-RM520N/releases/download/"
+
+# Root-owned 0711 work dir for downloads and extraction. www-data can stat a
+# staged file (the CGI shows "ready") but cannot plant or swap anything here.
+STAGE_DIR="/tmp/qmanager_stage"
+STAGED_TARBALL="$STAGE_DIR/qmanager.tar.gz"
+STAGED_VERSION="$STAGE_DIR/version"
+STAGED_SHA="$STAGE_DIR/sha256"
+INSTALL_SRC="$STAGE_DIR/qmanager_install"
+
+# Tags: letters, digits, ".", "_", "-"; no leading dot or dash, no "..".
+is_safe_tag() {
+    case "$1" in
+        ""|.*|-*|*..*|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    return 0
+}
+
+is_sha256() {
+    case "$1" in *[!0-9a-f]*) return 1 ;; esac
+    [ "${#1}" -eq 64 ]
+}
+
+# Accept only <RELEASE_PREFIX><safe tag>/qmanager.tar.gz.
+validate_url() {
+    local url="$1" tag
+    case "$url" in
+        "$RELEASE_PREFIX"*/qmanager.tar.gz) ;;
+        *) return 1 ;;
+    esac
+    tag="${url#"$RELEASE_PREFIX"}"
+    is_safe_tag "${tag%/qmanager.tar.gz}"
+}
+
+stage_dir_ok() {
+    [ -d "$STAGE_DIR" ] && [ ! -L "$STAGE_DIR" ] &&
+        [ "$(stat -c '%u %a' "$STAGE_DIR" 2>/dev/null)" = "0 711" ]
+}
+
+# Recreate the stage dir empty; fails if something else claims the path first.
+reset_stage_dir() {
+    cd /
+    rm -rf "$STAGE_DIR"
+    mkdir -m 0711 "$STAGE_DIR" 2>/dev/null && stage_dir_ok
+}
+
+# Keep a valid stage dir (and any staged download in it); rebuild it otherwise.
+# Only root can write inside, so its contents need no wipe.
+ensure_stage_dir() {
+    stage_dir_ok || reset_stage_dir || return 1
+    cd /
+    rm -rf "$INSTALL_SRC" "$STAGE_DIR/download.tar.gz"
+}
+
+# A regular, root-owned file inside the stage dir (no symlinks).
+staged_file_ok() {
+    [ -f "$1" ] && [ ! -L "$1" ] && [ "$(stat -c '%u' "$1" 2>/dev/null)" = "0" ]
+}
+
+# Verify that a tarball is readable and contains the expected installer entry.
+verify_archive() {
+    local path="$1"
+    tar tzf "$path" >/dev/null 2>&1 || return 1
+    tar tzf "$path" 2>/dev/null | grep -q "install_rm520n.sh" || return 1
+    return 0
+}
+
+# Fetch the release's sibling sha256sum.txt and check the tarball against it.
+# The checksum URL is always derived from the validated tarball URL, never
+# taken from the caller. Every mode fails closed.
+# Returns 0 = verified, 1 = could not verify, 2 = mismatch.
+verify_checksum() {
+    local tarball="$1" url="$2" checksum_url checksum_file expected_sha actual_sha
+
+    if ! validate_url "$url"; then
+        log "SHA-256 not verified — not an official release URL: $url"
+        return 1
+    fi
+    checksum_url="${url%/qmanager.tar.gz}/sha256sum.txt"
+
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        log "SHA-256 not verified — sha256sum not available on this system"
+        return 1
+    fi
+
+    checksum_file="$STAGE_DIR/sha256sum.txt"
+    rm -f "$checksum_file"
+    if ! http_download "$checksum_url" "$checksum_file" 15; then
+        log "SHA-256 not verified — checksum file not available at $checksum_url"
+        rm -f "$checksum_file"
+        return 1
+    fi
+
+    expected_sha=$(awk '$2 == "qmanager.tar.gz" || $2 == "*qmanager.tar.gz" { print tolower($1); exit }' \
+        "$checksum_file" 2>/dev/null)
+    rm -f "$checksum_file"
+    actual_sha=$(sha256sum "$tarball" 2>/dev/null | awk '{ print $1 }')
+
+    if ! is_sha256 "$expected_sha" || ! is_sha256 "$actual_sha"; then
+        log "SHA-256 not verified — could not parse checksum value(s) from $checksum_url"
+        return 1
+    fi
+
+    if [ "$actual_sha" != "$expected_sha" ]; then
+        log "SHA-256 MISMATCH (expected $expected_sha, got $actual_sha)"
+        return 2
+    fi
+
+    log "SHA-256 verified ($actual_sha)"
+    return 0
+}
+
+# Die unless verify_checksum passes; removes the tarball on failure.
+require_checksum() {
+    verify_checksum "$1" "$2"
+    case $? in
+        0) return 0 ;;
+        2) rm -f "$1"; die "SHA-256 mismatch — download may be corrupt or tampered" ota_sha256_mismatch ;;
+        *) rm -f "$1"; die "SHA-256 could not be verified — refusing to install an unverified update" ota_sha256_unverified ;;
+    esac
+}
+
+# Run install_rm520n.sh with step-streaming progress updates to the UI.
+# Installer stdout/stderr go to INSTALL_LOG (separate from the worker LOG_FILE)
+# so we can poll it cleanly; the install log is appended to LOG_FILE on exit.
+# Returns the installer's exit code.
+run_install_with_progress() {
+    local version="$1"
+    local last_label="" current_label="" step_line="" rc=0
+
+    # Covers the auto-update timer too: the install stops lighttpd and would kill the restore worker.
+    if pid_is "$(cat /tmp/qmanager_config_restore.pid 2>/dev/null)" qmanager_config_restore; then
+        die "A configuration restore is running. Try again when it finishes." ota_restore_running
+    fi
+
+    : > "$INSTALL_LOG"
+    # --force skips the firmware prompt (stdin is closed). The flag defers lighttpd's
+    # restart: a reboot always follows a successful install.
+    QM_DEFER_LIGHTTPD_RESTART=1 sh install_rm520n.sh --force --skip-packages --no-reboot >> "$INSTALL_LOG" 2>&1 &
+    local install_pid=$!
+
+    while pid_alive "$install_pid"; do
+        sleep 2
+
+        # Installer's _log_raw() emits "[timestamp] === Step N/M: <label> ===" —
+        # this is the documented tail-target contract. Plain ASCII, no ANSI noise.
+        step_line=$(grep '=== Step ' "$INSTALL_LOG" 2>/dev/null | tail -1)
+        if [ -n "$step_line" ]; then
+            current_label=$(printf '%s' "$step_line" \
+                | sed -n 's/.*=== Step [0-9]*\/[0-9]*: \(.*\) ===.*/\1/p')
+        fi
+
+        if [ -n "$current_label" ] && [ "$current_label" != "$last_label" ]; then
+            write_status "installing" "$current_label" "$version" ""
+            log "Install step: $current_label"
+            last_label="$current_label"
+        fi
+    done
+
+    wait "$install_pid"
+    rc=$?
+
+    # Merge install output into the main worker log for a single audit trail
+    cat "$INSTALL_LOG" >> "$LOG_FILE" 2>/dev/null
+    rm -f "$INSTALL_LOG"
+
+    return $rc
+}
+
+# Verify the installed VERSION matches what was expected.
+# A VERSION.pending file means the installer died mid-flight.
+#
+# The comparison is semantic, not byte-exact. install_rm520n.sh stamps
+# VERSION with whatever build.sh baked in from package.json at build time —
+# which can carry a pre-release suffix (e.g. "v0.1.13-draft") even when the
+# GitHub release itself was tagged clean ("v0.1.13"). A byte-exact compare
+# would then report a fully successful OTA as a fatal failure. Rule:
+#   - major.minor.patch CORE differs               -> fatal (die)
+#   - only a "v" prefix / "-suffix" difference      -> warn, treat as success
+# We extract cores with plain shell parameter expansion (matching semver.sh's
+# own "${v#v}" / "${v%%-*}" idiom) rather than adding a new helper to
+# semver.sh, since semver_compare()'s ordering semantics (no-prerelease always
+# "newer" than any prerelease) can't disambiguate a genuine numeric mismatch
+# from a same-core prerelease-only difference — both can return exit code 2.
+post_install_check() {
+    local expected="$1" actual=""
+
+    if [ -f "$PENDING_FILE" ]; then
+        die "Install appears to have crashed mid-flight (VERSION.pending exists)" ota_install_crashed
+    fi
+
+    if [ -f "$VERSION_FILE" ]; then
+        actual=$(tr -d '[:space:]' < "$VERSION_FILE")
+    fi
+
+    if [ -z "$actual" ]; then
+        die "Install completed but VERSION not stamped (expected $expected, got <missing>)" ota_version_mismatch
+    fi
+
+    if [ "$actual" = "$expected" ]; then
+        return 0
+    fi
+
+    local expected_core actual_core
+    expected_core="${expected#v}"; expected_core="${expected_core%%-*}"
+    actual_core="${actual#v}"; actual_core="${actual_core%%-*}"
+
+    if [ "$expected_core" != "$actual_core" ]; then
+        die "Install completed but VERSION mismatch (expected $expected, got $actual)" ota_version_mismatch
+    fi
+
+    log "WARNING: VERSION differs only by a 'v' prefix / pre-release suffix (expected '$expected', got '$actual') — numeric core '$actual_core' matches, treating install as success."
+}
+
+cleanup() {
+    rm -f "$PID_FILE"
+    cd /                        # never delete our own CWD (would break getcwd)
+    rm -rf "$INSTALL_SRC"
+    rm -f "$WATCHCAT_LOCK"
+}
+
+# Wait for the /reboot/ page to confirm it has loaded by writing
+# REBOOT_ACK_FILE (via update.sh action=reboot_ack), then proceed with the
+# reboot syscall. Bounded by REBOOT_ACK_TIMEOUT so a closed tab, auto-update,
+# or any other UI-less invocation never blocks the reboot indefinitely.
+wait_for_reboot_ack() {
+    rm -f "$REBOOT_ACK_FILE" 2>/dev/null
+    log "Waiting up to ${REBOOT_ACK_TIMEOUT}s for /reboot/ ack..."
+    local i=0
+    while [ $i -lt "$REBOOT_ACK_TIMEOUT" ]; do
+        if [ -f "$REBOOT_ACK_FILE" ]; then
+            log "Reboot ack received after ${i}s — UI confirmed /reboot/ loaded"
+            rm -f "$REBOOT_ACK_FILE" 2>/dev/null
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    log "Reboot ack timeout (${REBOOT_ACK_TIMEOUT}s) — proceeding without UI confirmation"
+    return 0
+}
+
+die() {
+    log "ERROR: $1"
+    write_status "error" "$1" "${VERSION:-}" "" "${2:-}"
+    cleanup
+    exit 1
+}
+
+# --- Detach ------------------------------------------------------------------
+
+# Leave the caller's cgroup: stopping lighttpd or the auto-update oneshot would kill us mid-install.
+# systemd expands "$VAR" in unit arguments (and drops it if empty), so such arguments run in place.
+case "$*" in *'$'*) _qm_detach=0 ;; *) _qm_detach=1 ;; esac
+if [ "$_qm_detach" = 1 ] && [ -z "${QM_UPDATE_DETACHED:-}" ] \
+   && grep -qE 'lighttpd\.service|qmanager-auto-update\.service' /proc/self/cgroup 2>/dev/null \
+   && command -v systemd-run >/dev/null 2>&1; then
+    _try=0
+    while [ $_try -lt 2 ]; do
+        systemd-run --unit=qm-update-worker --no-block --collect --quiet \
+            -E QM_UPDATE_DETACHED=1 /usr/bin/qmanager_update "$@" </dev/null >/dev/null 2>&1 && exit 0
+        # not-found: the start failed for another reason, so run in place below
+        [ "$(systemctl show -p LoadState --value qm-update-worker 2>/dev/null)" = "not-found" ] && break
+        _try=$((_try + 1))
+        [ $_try -lt 2 ] && sleep 2
+    done
+    # Still present after the retry: a live update owns the status file, so leave it alone.
+    [ $_try -ge 2 ] && exit 1
+fi
+
+# --- Lock & setup ------------------------------------------------------------
+
+# fs.protected_regular=1 prevents root from truncating files owned by other
+# users in sticky /tmp dirs. Prior failed CGI attempts may have left these
+# files owned by www-data, so rm-then-create instead of plain truncate.
+rm -f "$LOG_FILE" "$PID_FILE" "$REBOOT_ACK_FILE" 2>/dev/null || true
+echo $$ > "$PID_FILE"
+trap cleanup EXIT INT TERM
+: > "$LOG_FILE"
+
+MODE="$1"
+log "Starting qmanager_update mode=$MODE"
+
+# Stop watchdog early to prevent interference during download/install.
+# Touch the same maintenance lock the daemon's check_locked() honors, so any
+# watchcat instance still finishing a cycle parks in LOCKED instead of racing
+# the OTA's AT commands; cleanup() removes it on exit.
+# svc_stop translates underscores to dashes, so this maps to qmanager-watchcat.service
+touch "$WATCHCAT_LOCK"
+svc_stop qmanager_watchcat
+log "Watchdog stopped"
+
+# =============================================================================
+# INSTALL mode — download, verify, install, reboot in one step
+# =============================================================================
+if [ "$MODE" = "install" ]; then
+    URL="$2"
+    VERSION="$3"
+    SIZE="$4"
+    # $5 (--unattended) is still passed by qmanager_auto_update but no longer
+    # changes anything: every path now fails closed on an unverified checksum.
+
+    if ! validate_url "$URL"; then
+        die "Invalid download URL" ota_invalid_url
+    fi
+    ensure_stage_dir || die "Could not create a private staging directory" ota_stage_failed
+
+    # 1. Download
+    write_status "downloading" "Downloading update..." "$VERSION" "$SIZE"
+    log "Downloading $URL"
+    download_path="$STAGE_DIR/download.tar.gz"
+
+    if ! http_download "$URL" "$download_path"; then
+        die "Download failed. Check your internet connection." ota_download_failed
+    fi
+    log "Download complete"
+
+    # 2. Verify archive integrity
+    write_status "verifying" "Verifying archive..." "$VERSION" ""
+    if ! verify_archive "$download_path"; then
+        rm -f "$download_path"
+        die "Downloaded file is corrupt or missing install_rm520n.sh." ota_archive_corrupt
+    fi
+    log "Archive verified"
+
+    # 2b. Verify SHA-256 (fails closed).
+    write_status "verifying" "Verifying SHA-256..." "$VERSION" ""
+    require_checksum "$download_path" "$URL"
+
+    # 3. Save current version for rollback tracking
+    write_status "installing" "Installing update..." "$VERSION" ""
+    current_ver=$(get_current_version)
+    mkdir -p "$UPDATES_DIR"
+    echo "$current_ver" > "$UPDATES_DIR/previous_version"
+    log "Saved previous version ($current_ver) for rollback"
+
+    # 4. Extract and run installer with step-streaming progress
+    tar xzf "$download_path" -C "$STAGE_DIR" || die "Extraction failed" ota_extract_failed
+    rm -f "$download_path"
+    cd "$INSTALL_SRC" || die "Extraction failed — $INSTALL_SRC not found" ota_extract_failed
+
+    # Scrub any pre-timer-migration dead cron markers before handing off to
+    # the installer (which re-arms the current timers from config either way).
+    scrub_legacy_cron
+
+    log "Running install_rm520n.sh --force --skip-packages --no-reboot"
+    if ! run_install_with_progress "$VERSION"; then
+        die "Installation failed" ota_install_failed
+    fi
+    log "Install complete"
+
+    # 5. Verify the VERSION file was stamped correctly
+    post_install_check "$VERSION"
+
+    # 6. Cleanup and reboot. cd out of the staging dir before deleting it —
+    #    we cd'd into $INSTALL_SRC to run the installer, and deleting
+    #    our own CWD leaves getcwd() failing for everything after (and any
+    #    relative path a future edit adds in this window).
+    cd /
+    rm -rf "$STAGE_DIR"
+    write_status "rebooting" "Rebooting device..." "$VERSION" ""
+    log "Rebooting"
+    rm -f "$PID_FILE"
+    trap - EXIT INT TERM
+    wait_for_reboot_ack
+    reboot
+    exit 0
+fi
+
+# =============================================================================
+# DOWNLOAD mode — download and verify only, no install
+# =============================================================================
+if [ "$MODE" = "download" ]; then
+    URL="$2"
+    VERSION="$4"
+    # $3 (checksum URL) is ignored: verify_checksum derives it from $URL.
+
+    # The URL must be the release for exactly this version tag.
+    if ! is_safe_tag "$VERSION" || [ "$URL" != "${RELEASE_PREFIX}${VERSION}/qmanager.tar.gz" ]; then
+        die "Invalid download URL" ota_invalid_url
+    fi
+    reset_stage_dir || die "Could not create a private staging directory" ota_stage_failed
+    # Pre-v0.1.19 staging paths; a leftover must never look like a staged update.
+    rm -f /tmp/qmanager_staged.tar.gz /tmp/qmanager_staged_version
+
+    # 1. Download tarball
+    write_status "downloading" "Downloading QManager ${VERSION}..." "$VERSION" ""
+    log "Downloading $URL"
+
+    if ! http_download "$URL" "$STAGED_TARBALL"; then
+        die "Download failed. Check your internet connection." ota_download_failed
+    fi
+    log "Download complete"
+
+    # 2. Verify archive integrity
+    if ! verify_archive "$STAGED_TARBALL"; then
+        rm -f "$STAGED_TARBALL"
+        die "Downloaded file is corrupt or missing install_rm520n.sh." ota_archive_corrupt
+    fi
+    log "Archive integrity verified"
+
+    # 3. SHA-256 verification (fails closed).
+    write_status "verifying" "Verifying SHA-256..." "$VERSION" ""
+    require_checksum "$STAGED_TARBALL" "$URL"
+
+    # 4. Stage version marker + the verified hash, re-checked by install_staged
+    echo "$VERSION" > "$STAGED_VERSION"
+    sha256sum "$STAGED_TARBALL" | awk '{ print $1 }' > "$STAGED_SHA"
+    chmod 0644 "$STAGED_TARBALL" "$STAGED_VERSION" "$STAGED_SHA"
+
+    # 5. Report ready
+    local_size=$(du -k "$STAGED_TARBALL" 2>/dev/null | awk '{printf "%.1f MB", $1/1024}')
+    write_status "ready" "Download verified ($local_size)" "$VERSION" "$local_size"
+    log "Staged $VERSION ($local_size) — ready for install"
+
+    rm -f "$PID_FILE"
+    trap - EXIT INT TERM
+    exit 0
+fi
+
+# =============================================================================
+# INSTALL_STAGED mode — install a previously downloaded tarball
+# =============================================================================
+if [ "$MODE" = "install_staged" ]; then
+    # Only trust files the download step left in the root-only stage dir,
+    # and re-check the hash it recorded.
+    stage_dir_ok || die "No staged download found. Download first." ota_no_staged
+    staged_file_ok "$STAGED_TARBALL" || die "No staged tarball found. Download first." ota_no_staged
+    staged_file_ok "$STAGED_VERSION" || die "No staged version marker found." ota_no_staged
+    staged_file_ok "$STAGED_SHA" || die "No staged checksum found. Download again." ota_no_staged
+
+    VERSION=$(cat "$STAGED_VERSION" 2>/dev/null)
+    is_safe_tag "$VERSION" || die "Staged version marker is invalid. Download again." ota_no_staged
+    staged_sha=$(cat "$STAGED_SHA" 2>/dev/null)
+    actual_sha=$(sha256sum "$STAGED_TARBALL" 2>/dev/null | awk '{ print $1 }')
+    if ! is_sha256 "$staged_sha" || [ "$actual_sha" != "$staged_sha" ]; then
+        die "Staged download changed since it was verified. Download again." ota_staged_changed
+    fi
+    log "Installing staged version: $VERSION ($actual_sha)"
+
+    # 1. Save current version for rollback tracking
+    write_status "installing" "Installing QManager ${VERSION}..." "$VERSION" ""
+    current_ver=$(get_current_version)
+    mkdir -p "$UPDATES_DIR"
+    echo "$current_ver" > "$UPDATES_DIR/previous_version"
+    log "Saved previous version ($current_ver)"
+
+    # 2. Extract and run installer with step-streaming progress
+    tar xzf "$STAGED_TARBALL" -C "$STAGE_DIR" || die "Extraction failed" ota_extract_failed
+    rm -f "$STAGED_TARBALL" "$STAGED_VERSION" "$STAGED_SHA"
+    cd "$INSTALL_SRC" || die "Extraction failed — $INSTALL_SRC not found" ota_extract_failed
+
+    # Scrub any pre-timer-migration dead cron markers before handing off to
+    # the installer (which re-arms the current timers from config either way).
+    scrub_legacy_cron
+
+    log "Running install_rm520n.sh --force --skip-packages --no-reboot"
+    if ! run_install_with_progress "$VERSION"; then
+        die "Installation failed" ota_install_failed
+    fi
+    log "Install complete"
+
+    # 3. Verify the VERSION file was stamped correctly
+    post_install_check "$VERSION"
+
+    # 4. Cleanup and reboot. cd out of the staging dir before deleting it —
+    #    we cd'd into $INSTALL_SRC to run the installer, and deleting
+    #    our own CWD leaves getcwd() failing for everything after (and any
+    #    relative path a future edit adds in this window).
+    cd /
+    rm -rf "$STAGE_DIR"
+    write_status "rebooting" "Rebooting device..." "$VERSION" ""
+    log "Rebooting"
+    rm -f "$PID_FILE"
+    trap - EXIT INT TERM
+    wait_for_reboot_ack
+    reboot
+    exit 0
+fi
+
+# Rollback target (<= v0.1.17) flocks only /tmp/qmanager_at.lock: ensure the new lock,
+# make a trusted legacy lock + bridge marker, then wait out holders that predate the marker.
+rollback_prep_at_lock() {
+    local d=/run/qmanager_at st tries=0
+    if [ -L "$d" ] || { [ -e "$d" ] && [ ! -d "$d" ]; }; then rm -rf "$d" 2>/dev/null || log "WARN: could not remove stray $d"; fi
+    [ -d "$d" ] || mkdir "$d" 2>/dev/null || log "WARN: could not create $d"
+    chown root:dialout "$d" 2>/dev/null || true
+    chmod 0750 "$d" 2>/dev/null || true
+    [ -e "$d/at.lock" ] || : > "$d/at.lock" 2>/dev/null || log "WARN: could not create $d/at.lock"
+    chown root:dialout "$d/at.lock" 2>/dev/null || true
+    chmod 0640 "$d/at.lock" 2>/dev/null || true
+    # Trusted legacy = regular file, owner root/www-data, one link; else replace it as v0.1.17 setup would.
+    st=$(stat -c '%u %h %F' /tmp/qmanager_at.lock 2>/dev/null) || st=""
+    case "$st" in
+        "0 1 regular"*|"33 1 regular"*) ;;
+        *)
+            [ -z "$st" ] || rm -f /tmp/qmanager_at.lock 2>/dev/null || log "WARN: could not remove untrusted legacy lock"
+            touch /tmp/qmanager_at.lock 2>/dev/null || log "WARN: could not create legacy lock"
+            chown www-data:www-data /tmp/qmanager_at.lock 2>/dev/null || true
+            chmod 666 /tmp/qmanager_at.lock 2>/dev/null || true
+            ;;
+    esac
+    : > "$d/bridge" 2>/dev/null || log "WARN: could not create $d/bridge"
+    chown root:root "$d/bridge" 2>/dev/null || true
+    chmod 0644 "$d/bridge" 2>/dev/null || true
+    # Drain: BusyBox flock has no -w, so poll (1 s, up to 200 s).
+    while [ "$tries" -lt 200 ]; do
+        flock -x -n "$d/at.lock" true 2>/dev/null && return 0
+        tries=$((tries + 1))
+        sleep 1
+    done
+    log "WARN: AT lock still held after 200 s; continuing rollback"
+    return 0
+}
+
+# =============================================================================
+# ROLLBACK mode
+# =============================================================================
+if [ "$MODE" = "rollback" ]; then
+    URL="$2"
+    VERSION="$3"
+
+    if [ -z "$URL" ] || [ -z "$VERSION" ]; then
+        die "Rollback requires URL and version arguments"
+    fi
+
+    # Rollback only downloads from official releases
+    if ! validate_url "$URL"; then
+        die "Invalid rollback URL" ota_invalid_url
+    fi
+    ensure_stage_dir || die "Could not create a private staging directory" ota_stage_failed
+
+    # 1. Download rollback archive
+    write_status "downloading" "Downloading previous version..." "$VERSION" ""
+    log "Downloading rollback archive $URL"
+    download_path="$STAGE_DIR/download.tar.gz"
+
+    if ! http_download "$URL" "$download_path"; then
+        die "Rollback download failed. Check your internet connection." ota_download_failed
+    fi
+    log "Rollback download complete"
+
+    # 2. Verify archive integrity
+    if ! verify_archive "$download_path"; then
+        rm -f "$download_path"
+        die "Rollback archive is corrupt or missing install_rm520n.sh." ota_archive_corrupt
+    fi
+    log "Rollback archive verified"
+
+    # 2b. Verify SHA-256 (fails closed)
+    write_status "verifying" "Verifying SHA-256..." "$VERSION" ""
+    require_checksum "$download_path" "$URL"
+
+    # 3. Save current version so the next rollback can swap back
+    write_status "installing" "Restoring previous version..." "$VERSION" ""
+    current_ver=$(get_current_version)
+    mkdir -p "$UPDATES_DIR"
+    echo "$current_ver" > "$UPDATES_DIR/previous_version"
+    log "Saved current version ($current_ver) before rollback"
+
+    # 4. Extract and run installer with step-streaming progress
+    tar xzf "$download_path" -C "$STAGE_DIR" || die "Extraction failed" ota_extract_failed
+    rm -f "$download_path"
+    cd "$INSTALL_SRC" || die "Extraction failed — $INSTALL_SRC not found" ota_extract_failed
+
+    # Scrub any pre-timer-migration dead cron markers before handing off to
+    # the installer (which re-arms the current timers from config either way).
+    scrub_legacy_cron
+
+    rollback_prep_at_lock
+
+    log "Running install_rm520n.sh --force --skip-packages --no-reboot"
+    if ! run_install_with_progress "$VERSION"; then
+        die "Rollback installation failed" ota_rollback_failed
+    fi
+    log "Rollback install complete"
+
+    # 5. Verify the VERSION file was stamped correctly
+    post_install_check "$VERSION"
+
+    # 6. Cleanup and reboot. cd out of the staging dir before deleting it —
+    #    we cd'd into $INSTALL_SRC to run the installer, and deleting
+    #    our own CWD leaves getcwd() failing for everything after (and any
+    #    relative path a future edit adds in this window).
+    cd /
+    rm -rf "$STAGE_DIR"
+    write_status "rebooting" "Rebooting device..." "$VERSION" ""
+    log "Rebooting"
+    rm -f "$PID_FILE"
+    trap - EXIT INT TERM
+    wait_for_reboot_ack
+    reboot
+    exit 0
+fi
+
+die "Unknown mode: $MODE"

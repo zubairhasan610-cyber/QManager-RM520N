@@ -19,27 +19,21 @@ jobs:
 
       - name: Build ARMHF backend
         run: |
-          docker run --rm \
-            -v "$GITHUB_WORKSPACE:/src" \
-            -w /src \
-            debian:bullseye \
-            bash -euxc '
-              sed -i 's|deb.debian.org/debian-security|archive.debian.org/debian-security|g' /etc/apt/sources.list
-              apt-get -o Acquire::Check-Valid-Until=false update
-              apt-get install -y curl build-essential gcc-arm-linux-gnueabihf
-              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-              source "$HOME/.cargo/env"
-              rustup target add armv7-unknown-linux-gnueabihf
-              export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
-              cargo build --release \
-                --target armv7-unknown-linux-gnueabihf \
-                --manifest-path native/qmanager_atd/Cargo.toml
-              mkdir -p /src/dist
-              cp native/qmanager_atd/target/armv7-unknown-linux-gnueabihf/release/qmanager_atd /src/dist/
-              cd /src/dist
-              sha256sum qmanager_atd > SHA256SUMS
-              tar -czf qmanager-backend-armhf.tar.gz qmanager_atd SHA256SUMS
-            '
+          docker run --rm -v "$GITHUB_WORKSPACE:/src" -w /src debian:bullseye bash -euxc '
+            sed -i "s#deb.debian.org/debian-security#archive.debian.org/debian-security#g" /etc/apt/sources.list
+            apt-get -o Acquire::Check-Valid-Until=false update
+            apt-get install -y curl build-essential gcc-arm-linux-gnueabihf
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source "$HOME/.cargo/env"
+            rustup target add armv7-unknown-linux-gnueabihf
+            export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
+            cargo build --release --target armv7-unknown-linux-gnueabihf --manifest-path native/qmanager_atd/Cargo.toml
+            mkdir -p /src/dist
+            cp native/qmanager_atd/target/armv7-unknown-linux-gnueabihf/release/qmanager_atd /src/dist/
+            cd /src/dist
+            sha256sum qmanager_atd > SHA256SUMS
+            tar -czf qmanager-backend-armhf.tar.gz qmanager_atd SHA256SUMS
+          '
 
       - name: Upload backend artifact
         uses: actions/upload-artifact@v4
